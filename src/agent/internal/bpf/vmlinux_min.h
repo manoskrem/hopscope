@@ -36,9 +36,10 @@ typedef __u16                  __sum16;
 typedef __u32                  __wsum;
 typedef long unsigned int      size_t;
 
-/* Only the one map-type ordinal we use (full enum lives in the UAPI / vmlinux.h). */
+/* Only the map-type ordinals we use (full enum lives in the UAPI / vmlinux.h). */
 enum bpf_map_type {
-	BPF_MAP_TYPE_RINGBUF = 27,
+	BPF_MAP_TYPE_LRU_HASH = 9,  /* per-pid_tgid in-flight recv context (auto-evicts on pressure) */
+	BPF_MAP_TYPE_RINGBUF  = 27,
 };
 
 #pragma clang attribute push(__attribute__((preserve_access_index)), apply_to = record)

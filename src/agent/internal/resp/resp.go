@@ -34,6 +34,41 @@ func Parse(b []byte) (verb string, firstKey string, ok bool) {
 	return parseInline(b)
 }
 
+// ParseError extracts the error code and message line from a captured RESP simple-error
+// reply ("-CODE message\r\n"). It is the recv-side counterpart to Parse and the privacy
+// boundary for the receive path: it only ever runs on a buffer the kernel already gated on a
+// leading '-', and a RESP error string is protocol-level diagnostic text (the broker's own
+// message), NOT a business payload — so capturing it is allowed, exactly like an exception
+// message. A non-error reply (success values, bulk strings, integers, arrays) yields ok=false,
+// so a reply that carries a value can never surface through this package.
+//
+//	code    = the first whitespace-delimited token after '-' (e.g. "WRONGTYPE", "ERR")
+//	message = the full error line after '-', up to the CRLF (or end-of-prefix if truncated)
+//
+// ok is false if b does not start with '-' or carries no error content.
+func ParseError(b []byte) (code string, message string, ok bool) {
+	if len(b) == 0 || b[0] != '-' {
+		return "", "", false
+	}
+	// The error line is everything after '-' up to the first CRLF. The 256B capture may
+	// truncate it (no CRLF), which is fine — take what's present and never read past it.
+	line := b[1:]
+	if i := bytes.Index(line, crlf); i >= 0 {
+		line = line[:i]
+	} else if i := bytes.IndexByte(line, '\r'); i >= 0 {
+		line = line[:i] // tolerate a lone CR at the truncation boundary
+	}
+	message = strings.TrimSpace(string(line))
+	if message == "" {
+		return "", "", false
+	}
+	code = message
+	if sp := strings.IndexByte(message, ' '); sp >= 0 {
+		code = message[:sp]
+	}
+	return code, message, true
+}
+
 // parseArray handles the RESP array form a real client sends:
 //
 //	*<N>\r\n $<len>\r\n<arg0>\r\n $<len>\r\n<arg1>\r\n ...

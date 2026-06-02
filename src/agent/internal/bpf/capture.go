@@ -21,19 +21,30 @@ import (
 // or run on a BTF-enabled kernel. Checked via errors.Is by the entrypoint.
 var ErrNoKernelBTF = errors.New("kernel BTF unavailable (no /sys/kernel/btf/vmlinux)")
 
-// Event is one captured Redis send: the issuing process and the bounded request
-// prefix. Data is a private copy (the ring-buffer sample is reused after Read).
+// Direction tags a captured Event: a request send vs. a RESP error reply on the receive path.
+const (
+	DirSend      uint8 = 0
+	DirRecvError uint8 = 1
+)
+
+// Event is one captured Redis observation: the issuing process and the bounded byte prefix
+// (a request on the send path, or an error reply line on the recv path). SockID is an opaque,
+// ephemeral per-socket key used only to correlate a reply back to its request — it is never
+// serialized. Data is a private copy (the ring-buffer sample is reused after Read).
 type Event struct {
-	PID  uint32
-	Comm string
-	Data []byte
+	PID       uint32
+	SockID    uint64
+	Direction uint8
+	Comm      string
+	Data      []byte
 }
 
-// Capture loads the eBPF program, attaches the tcp_sendmsg fentry hook, and streams
-// decoded Events. It requires CAP_BPF/CAP_PERFMON (or privileged) and kernel BTF.
+// Capture loads the eBPF program, attaches the tcp_sendmsg fentry hook plus the tcp_recvmsg
+// fentry+fexit pair, and streams decoded Events. It requires CAP_BPF/CAP_PERFMON (or privileged)
+// and kernel BTF.
 type Capture struct {
 	objs   bpfObjects
-	link   link.Link
+	links  []link.Link
 	reader *ringbuf.Reader
 }
 
@@ -55,23 +66,41 @@ func NewCapture() (*Capture, error) {
 		return nil, fmt.Errorf("load bpf objects (need kernel BTF at /sys/kernel/btf): %w", err)
 	}
 
-	lk, err := link.AttachTracing(link.TracingOptions{
-		Program:    objs.RedisTcpSendmsg,
-		AttachType: ebpf.AttachTraceFEntry,
-	})
-	if err != nil {
-		objs.Close()
-		return nil, fmt.Errorf("attach fentry tcp_sendmsg: %w", err)
+	// Attach all three programs: the send-path fentry and the recv-path fentry+fexit pair.
+	// The pair must both attach (the fexit reads what the fentry stashed), so any failure tears
+	// down what is already attached.
+	attachments := []struct {
+		desc string
+		prog *ebpf.Program
+		at   ebpf.AttachType
+	}{
+		{"fentry tcp_sendmsg", objs.RedisTcpSendmsg, ebpf.AttachTraceFEntry},
+		{"fentry tcp_recvmsg", objs.RedisTcpRecvmsgEntry, ebpf.AttachTraceFEntry},
+		{"fexit tcp_recvmsg", objs.RedisTcpRecvmsgExit, ebpf.AttachTraceFExit},
+	}
+	var links []link.Link
+	for _, a := range attachments {
+		lk, err := link.AttachTracing(link.TracingOptions{Program: a.prog, AttachType: a.at})
+		if err != nil {
+			for _, l := range links {
+				l.Close()
+			}
+			objs.Close()
+			return nil, fmt.Errorf("attach %s: %w", a.desc, err)
+		}
+		links = append(links, lk)
 	}
 
 	rd, err := ringbuf.NewReader(objs.Events)
 	if err != nil {
-		lk.Close()
+		for _, l := range links {
+			l.Close()
+		}
 		objs.Close()
 		return nil, fmt.Errorf("open ring buffer: %w", err)
 	}
 
-	return &Capture{objs: objs, link: lk, reader: rd}, nil
+	return &Capture{objs: objs, links: links, reader: rd}, nil
 }
 
 // Run reads events until ctx is cancelled, invoking handle for each decoded Event.
@@ -96,10 +125,12 @@ func (c *Capture) Run(ctx context.Context, handle func(Event)) error {
 	}
 }
 
-// Close detaches the probe and releases the program/maps.
+// Close detaches the probes and releases the program/maps.
 func (c *Capture) Close() error {
 	c.reader.Close()
-	c.link.Close()
+	for _, l := range c.links {
+		l.Close()
+	}
 	return c.objs.Close()
 }
 
@@ -115,9 +146,11 @@ func decode(raw []byte) (Event, bool) {
 		n = len(re.Data)
 	}
 	return Event{
-		PID:  re.Pid,
-		Comm: commString(re.Comm),
-		Data: append([]byte(nil), re.Data[:n]...),
+		PID:       re.Pid,
+		SockID:    re.SockId,
+		Direction: re.Direction,
+		Comm:      commString(re.Comm),
+		Data:      append([]byte(nil), re.Data[:n]...),
 	}, true
 }
 

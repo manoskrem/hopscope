@@ -16,10 +16,15 @@ import (
 	"time"
 
 	"github.com/hopscope/agent/internal/bpf"
+	"github.com/hopscope/agent/internal/correlate"
 	"github.com/hopscope/agent/internal/mapper"
 	"github.com/hopscope/agent/internal/resp"
 	"github.com/hopscope/agent/internal/sink"
 )
+
+// recvTrackerSize bounds the per-socket request tracker. A reply correlates to the request that
+// immediately preceded it on the same socket, so only briefly-in-flight sockets matter.
+const recvTrackerSize = 4096
 
 func main() {
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
@@ -45,6 +50,9 @@ func main() {
 
 	snk := sink.New(sink.Config{Target: target, Logger: log})
 	m := mapper.New()
+	// tracker remembers the last request per socket so a later error reply on that socket can be
+	// attributed to it. The capture callback runs on a single goroutine, so it needs no lock.
+	tracker := correlate.New(recvTrackerSize)
 
 	go func() {
 		if err := snk.Run(ctx); err != nil && ctx.Err() == nil {
@@ -54,12 +62,32 @@ func main() {
 
 	log.Info("agent: capturing Redis traffic at the kernel", "engine", target)
 	err = capt.Run(ctx, func(ev bpf.Event) {
-		verb, key, ok := resp.Parse(ev.Data)
-		if !ok {
-			return // not a parseable RESP command (or a non-command segment)
+		switch ev.Direction {
+		case bpf.DirSend:
+			verb, key, ok := resp.Parse(ev.Data)
+			if !ok {
+				return // not a parseable RESP command (or a non-command segment)
+			}
+			env := m.FromCommand(ev.Comm, verb, key, ev.PID, time.Now())
+			tracker.Remember(ev.SockID, correlate.Request{
+				Verb: verb, FirstKey: key, Comm: ev.Comm, PID: ev.PID,
+				HopID: env.GetHopId(), TraceID: env.GetTraceId(),
+			})
+			snk.Enqueue(env) // never blocks (drop-oldest); a dropped hop never stalls capture
+
+		case bpf.DirRecvError:
+			code, line, ok := resp.ParseError(ev.Data)
+			if !ok {
+				return // not a RESP error reply
+			}
+			req, found := tracker.Take(ev.SockID)
+			if !found {
+				return // no request to attribute the error to (e.g. capture started mid-connection)
+			}
+			env := m.FromError(req.Comm, req.Verb, req.FirstKey, req.HopID, req.TraceID,
+				code, line, req.PID, time.Now())
+			snk.Enqueue(env)
 		}
-		env := m.FromCommand(ev.Comm, verb, key, ev.PID, time.Now())
-		snk.Enqueue(env) // never blocks (drop-oldest); a dropped hop never stalls capture
 	})
 	if err != nil && ctx.Err() == nil {
 		log.Error("agent: capture stopped unexpectedly", "err", err)

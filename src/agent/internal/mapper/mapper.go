@@ -52,12 +52,67 @@ func New() *Mapper { return &Mapper{} }
 func (m *Mapper) FromCommand(comm, verb, firstKey string, pid uint32, now time.Time) *contractsv1.EventEnvelope {
 	source := sanitizeComm(comm)
 	prefix := KeyPrefix(firstKey, keyDepth)
+
+	return &contractsv1.EventEnvelope{
+		TraceId:         "redis-activity:" + source + ":" + prefix,
+		HopId:           m.nextHopID(source, prefix),
+		ParentHopId:     "", // empty == null (proto3 has no null; the engine maps it back)
+		Source:          source,
+		Destination:     prefix,
+		BrokerType:      brokerType,
+		PayloadMetadata: baseMeta(source, prefix, verb, pid),
+		Timestamp:       timestamppb.New(now.UTC()),
+		ExecutionStatus: contractsv1.ExecutionStatus_SUCCESS,
+		ErrorDetails:    nil,
+	}
+}
+
+// FromError builds the EventEnvelope for a captured Redis error reply (a RESP "-CODE message").
+// It lands on the SAME source->dest edge as the request it correlates to (so the canvas turns
+// that one edge red) and links back to the request causally:
+//
+//	ParentHopId  = the correlated request's HopId (request -> error in the drill-down)
+//	TraceId      = the correlated request's TraceId (groups the pair under one trace)
+//	HopId        = fresh per call (the error is a new observation; the edge Count grows)
+//	ExecutionStatus = FAILED; ErrorDetails = {ExceptionType: code, Message: errLine}
+//
+// errLine is the broker's own diagnostic text (allowed, like an exception message) — never a
+// request argument/value. parentHopID/traceID come from internal/correlate (per-socket match).
+func (m *Mapper) FromError(comm, verb, firstKey, parentHopID, traceID, code, errLine string, pid uint32, now time.Time) *contractsv1.EventEnvelope {
+	source := sanitizeComm(comm)
+	prefix := KeyPrefix(firstKey, keyDepth)
+
+	meta := baseMeta(source, prefix, verb, pid)
+	meta["redisError"] = errLine
+
+	return &contractsv1.EventEnvelope{
+		TraceId:         traceID,
+		HopId:           m.nextHopID(source, prefix),
+		ParentHopId:     parentHopID,
+		Source:          source,
+		Destination:     prefix,
+		BrokerType:      brokerType,
+		PayloadMetadata: meta,
+		Timestamp:       timestamppb.New(now.UTC()),
+		ExecutionStatus: contractsv1.ExecutionStatus_FAILED,
+		ErrorDetails: &contractsv1.ErrorDetails{
+			ExceptionType:       code,
+			Message:             errLine,
+			TruncatedStackTrace: "",
+		},
+	}
+}
+
+// nextHopID returns a fresh, monotonic HopId so each observation is a distinct hop (the engine
+// dedupes by HopId; a stable id would collapse repeated commands into one edge with Count 1).
+func (m *Mapper) nextHopID(source, prefix string) string {
 	n := m.counter.Add(1)
+	return "agent-redis:" + source + ":" + prefix + ":" + strconv.FormatInt(n, 10)
+}
 
-	hopID := "agent-redis:" + source + ":" + prefix + ":" + strconv.FormatInt(n, 10)
-	traceID := "redis-activity:" + source + ":" + prefix
-
-	meta := map[string]string{
+// baseMeta builds the body-free routing metadata shared by every agent-sourced Redis hop.
+func baseMeta(source, prefix, verb string, pid uint32) map[string]string {
+	return map[string]string{
 		"destinationKind": "Topic",
 		"sourceKind":      "Service",
 		"redisEvent":      strings.ToLower(verb),
@@ -66,19 +121,6 @@ func (m *Mapper) FromCommand(comm, verb, firstKey string, pid uint32, now time.T
 		"capturedBy":      capturedBy,
 		"clientComm":      source,
 		"pid":             strconv.FormatUint(uint64(pid), 10),
-	}
-
-	return &contractsv1.EventEnvelope{
-		TraceId:         traceID,
-		HopId:           hopID,
-		ParentHopId:     "", // empty == null (proto3 has no null; the engine maps it back)
-		Source:          source,
-		Destination:     prefix,
-		BrokerType:      brokerType,
-		PayloadMetadata: meta,
-		Timestamp:       timestamppb.New(now.UTC()),
-		ExecutionStatus: contractsv1.ExecutionStatus_SUCCESS,
-		ErrorDetails:    nil,
 	}
 }
 

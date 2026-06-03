@@ -87,3 +87,83 @@ func contains(s, sub string) bool {
 	}
 	return false
 }
+
+func TestParseError(t *testing.T) {
+	cases := []struct {
+		name     string
+		in       string
+		wantCode string
+		wantMsg  string
+		wantOK   bool
+	}{
+		// ── RESP simple-error replies (a leading '-') ────────────────────────
+		{"err", "-ERR unknown command 'FOO'\r\n", "ERR", "ERR unknown command 'FOO'", true},
+		{"wrongtype",
+			"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+			"WRONGTYPE", "WRONGTYPE Operation against a key holding the wrong kind of value", true},
+		{"code only no message", "-ERR\r\n", "ERR", "ERR", true},
+		{"moved redirect", "-MOVED 3999 127.0.0.1:6381\r\n", "MOVED", "MOVED 3999 127.0.0.1:6381", true},
+
+		// ── truncated capture (no CRLF): take what's present ─────────────────
+		{"truncated mid-message", "-WRONGTYPE Operation agai", "WRONGTYPE", "WRONGTYPE Operation agai", true},
+
+		// ── NOT an error reply → ok=false (the privacy gate's userspace half) ─
+		{"simple string ok", "+OK\r\n", "", "", false},
+		{"bulk string value", "$5\r\nhello\r\n", "", "", false},
+		{"integer", ":42\r\n", "", "", false},
+		{"array", "*1\r\n$4\r\nPING\r\n", "", "", false},
+		{"empty", "", "", "", false},
+		{"dash only", "-\r\n", "", "", false},
+		{"dash then crlf no content", "-   \r\n", "", "", false},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			code, msg, ok := ParseError([]byte(c.in))
+			if ok != c.wantOK {
+				t.Fatalf("ok = %v, want %v (code=%q msg=%q)", ok, c.wantOK, code, msg)
+			}
+			if !ok {
+				return
+			}
+			if code != c.wantCode {
+				t.Errorf("code = %q, want %q", code, c.wantCode)
+			}
+			if msg != c.wantMsg {
+				t.Errorf("message = %q, want %q", msg, c.wantMsg)
+			}
+		})
+	}
+}
+
+// TestParseErrorNeverReturnsValue proves the dual privacy invariant on the recv side:
+// a SUCCESSFUL reply (which carries the business value) yields ok=false so the value never
+// surfaces, while a real error LINE round-trips intact (broker diagnostic text is allowed).
+func TestParseErrorNeverReturnsValue(t *testing.T) {
+	const secret = "supersecretvalue"
+
+	// A successful GET reply is a bulk string holding the value — never an error.
+	t.Run("success value never surfaces", func(t *testing.T) {
+		in := "$16\r\n" + secret + "\r\n"
+		code, msg, ok := ParseError([]byte(in))
+		if ok {
+			t.Fatalf("a bulk-string reply must not parse as an error (code=%q msg=%q)", code, msg)
+		}
+	})
+
+	// An error reply followed by a pipelined success value: only the error line (to CRLF)
+	// is taken; the trailing value bytes are never included.
+	t.Run("stops at crlf, no trailing value", func(t *testing.T) {
+		in := "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n$16\r\n" + secret + "\r\n"
+		code, msg, ok := ParseError([]byte(in))
+		if !ok {
+			t.Fatal("expected the error line to parse")
+		}
+		if code != "WRONGTYPE" {
+			t.Errorf("code = %q, want WRONGTYPE", code)
+		}
+		if contains(msg, secret) {
+			t.Fatalf("value leaked into the error message: %q", msg)
+		}
+	})
+}
